@@ -1,4 +1,4 @@
-# How pygit works
+# How pygit ZO works
 
 Git looks complicated from the outside, but its core is two small ideas:
 

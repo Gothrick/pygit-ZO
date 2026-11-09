@@ -1,10 +1,10 @@
-# pygit: Git, rebuilt in Python
+# pygit ZO: Git, rebuilt in Python
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)
 ![Tests](https://img.shields.io/badge/tests-91-2EA44F?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
 
-A small implementation of Git in Python (about 1,100 lines with comments), with no dependencies. It stores data in **Git's real object format**, so the two tools understand each other: a repository made by pygit passes `git fsck --strict`, and pygit can read the commits real Git wrote.
+pygit ZO is a small implementation of Git in Python (about 1,100 lines with comments), with no dependencies. You run it with the command `pygit`. It stores data in **Git's real object format**, so the two tools understand each other: a repository made by pygit passes `git fsck --strict`, and pygit can read the commits real Git wrote.
 
 ![pygit in a terminal](docs/screenshots/demo.jpg)
 
@@ -32,8 +32,8 @@ Revisions can be `HEAD`, a branch name, a full or abbreviated SHA-1, or `<rev>~N
 You need Python 3.10 or newer (developed and tested on 3.14).
 
 ```bash
-git clone https://github.com/Gothrick/mini-git-python.git
-cd mini-git-python
+git clone https://github.com/Gothrick/pygit-ZO.git
+cd pygit-ZO
 pip install -e .
 ```
 
