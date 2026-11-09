@@ -34,32 +34,46 @@ def _write_text(path: Path, text: str) -> None:
     path.write_bytes(text.encode("utf-8"))
 
 
-def valid_branch_name(name: str) -> bool:
-    """Git's rules for reference names, plus the names Windows cannot store as files."""
-    if (
-        not name
-        or name in ("HEAD", "@")
-        or name.startswith(("-", "/"))
-        or name.endswith(("/", "."))
-    ):
-        return False
+def branch_name_problem(name: str) -> str | None:
+    """Why a branch name is refused, or None if it is fine.
+
+    These are Git's rules for reference names, plus the names Windows cannot store as files.
+    """
+    if not name:
+        return "it is empty"
+    if name in ("HEAD", "@"):
+        return f"'{name}' is reserved"
+    if name.startswith(("-", "/")) or name.endswith(("/", ".")):
+        return "it cannot start with '-' or '/', or end with '/' or '.'"
     if ".." in name or "@{" in name or "//" in name:
-        return False
+        return "it cannot contain '..', '@{' or '//'"
     if any(ch in FORBIDDEN_IN_BRANCH or ord(ch) < 32 or ord(ch) == 127 for ch in name):
-        return False
+        return (
+            'it contains a character that is not allowed (space or one of ~ ^ : ? * [ \\ " < > |)'
+        )
     if LOOKS_LIKE_SHA.match(name):
-        return False  # it would be mistaken for an abbreviated commit id
+        return "it looks like a commit id, so it could not be told apart from one"
     for part in name.split("/"):
         if part.startswith(".") or part.endswith(".lock"):
-            return False
+            return "no part may start with '.' or end with '.lock'"
         if part.split(".")[0].lower() in WINDOWS_RESERVED:
-            return False
-    return True
+            return f"'{part}' is a reserved file name on Windows"
+    return None
+
+
+def valid_branch_name(name: str) -> bool:
+    return branch_name_problem(name) is None
+
+
+def _is_internal_name(name: str) -> bool:
+    lowered = name.lower()
+    # "git~1" is how Windows can also spell the ".git" folder.
+    return lowered in INTERNAL_NAMES or lowered.startswith("git~")
 
 
 def is_internal(relative: str) -> bool:
-    """Whether a path is inside a .pygit or .git folder."""
-    return any(part.lower() in INTERNAL_NAMES for part in relative.split("/"))
+    """Whether a path is inside a .pygit or .git folder (or one of their Windows aliases)."""
+    return any(_is_internal_name(part) for part in relative.split("/"))
 
 
 def _check_identity(value: str, what: str) -> None:
@@ -167,13 +181,15 @@ class Repository:
         return sorted(names)
 
     def branch_conflict(self, name: str) -> str | None:
-        """An existing branch that cannot coexist with this name ("a" and "a/b" are exclusive)."""
+        """An existing branch that cannot coexist with this name.
+
+        "a" and "a/b" are exclusive (a file cannot also be a folder), and so are names that
+        differ only by letter case, because Windows and macOS file systems treat them as one.
+        """
+        wanted = name.casefold()
         for existing in self.branches():
-            if (
-                existing == name
-                or name.startswith(existing + "/")
-                or existing.startswith(name + "/")
-            ):
+            other = existing.casefold()
+            if other == wanted or wanted.startswith(other + "/") or other.startswith(wanted + "/"):
                 return existing
         return None
 
@@ -182,11 +198,11 @@ class Repository:
         path = heads / name
         if not valid_branch_name(name):
             raise PygitError(f"branch '{name}' not found")
+        packed = f"refs/heads/{name}" in self._packed_refs()
+        if packed:
+            # Deleting only the loose file would leave the packed copy (an older commit) behind.
+            raise PygitError(f"branch '{name}' is stored in packed-refs, which pygit cannot edit")
         if not path.is_file():
-            if name in self.branches():
-                raise PygitError(
-                    f"branch '{name}' is stored in packed-refs, which pygit cannot edit"
-                )
             raise PygitError(f"branch '{name}' not found")
         path.unlink()
         # Like Git, remove the folders a branch like "feature/x" leaves empty.
@@ -200,7 +216,7 @@ class Repository:
     def resolve(self, revision: str) -> str:
         """Turn "HEAD", a branch name, a SHA-1 (or its start), or "<rev>~N" into a full SHA-1."""
         name, tilde, count = revision.partition("~")
-        if tilde and count and not count.isdigit():
+        if tilde and count and not (count.isascii() and count.isdigit()):
             raise PygitError(f"unknown revision '{revision}'")
         steps = (int(count) if count else 1) if tilde else 0
 
@@ -299,8 +315,12 @@ class Repository:
 
     # --- the working folder --------------------------------------------------------------
 
-    def _ignore_patterns(self) -> list[tuple[str, bool]]:
-        """The (pattern, anchored) pairs of .pygitignore; a leading "/" anchors to the top."""
+    def _ignore_patterns(self) -> list[tuple[str, bool, bool]]:
+        """(pattern, anchored, folders_only) for each line of .pygitignore.
+
+        A leading "/" anchors a pattern to the top folder; a trailing "/" makes it match
+        folders only.
+        """
         ignore_file = self.worktree / ".pygitignore"
         if not ignore_file.is_file():
             return []
@@ -309,26 +329,35 @@ class Repository:
             line = raw.strip()
             if line and not line.startswith("#"):
                 anchored = line.startswith("/")
-                patterns.append((line.strip("/") if anchored else line.rstrip("/"), anchored))
+                folders_only = line.endswith("/")
+                patterns.append((line.strip("/"), anchored, folders_only))
         return patterns
 
     @staticmethod
-    def _matches(patterns: list[tuple[str, bool]], relative: str) -> bool:
+    def _matches(
+        patterns: list[tuple[str, bool, bool]], relative: str, is_folder: bool = False
+    ) -> bool:
         parts = relative.split("/")
-        prefixes = ["/".join(parts[:end]) for end in range(1, len(parts) + 1)]
-        for pattern, anchored in patterns:
-            if anchored:
-                if any(fnmatch.fnmatchcase(prefix, pattern) for prefix in prefixes):
-                    return True
-            elif fnmatch.fnmatchcase(relative, pattern) or any(
-                fnmatch.fnmatchcase(part, pattern) for part in parts
-            ):
+        # Which parts of the path are folders: all but the last, and the last if it is one.
+        folder_flags = [True] * (len(parts) - 1) + [is_folder]
+        for pattern, anchored, folders_only in patterns:
+            candidates = []
+            for end in range(1, len(parts) + 1):
+                if folders_only and not folder_flags[end - 1]:
+                    continue
+                if anchored:
+                    candidates.append("/".join(parts[:end]))
+                else:
+                    candidates.append(parts[end - 1])
+                    if end == len(parts):
+                        candidates.append(relative)
+            if any(fnmatch.fnmatchcase(candidate, pattern) for candidate in candidates):
                 return True
         return False
 
-    def is_ignored(self, relative: str) -> bool:
+    def is_ignored(self, relative: str, is_folder: bool = False) -> bool:
         """Whether a path matches a pattern in .pygitignore (simple wildcards, no negation)."""
-        return self._matches(self._ignore_patterns(), relative)
+        return self._matches(self._ignore_patterns(), relative, is_folder)
 
     def worktree_files(self, under: str = "") -> list[str]:
         """Paths of the files in the working folder (or below one folder), minus ignored ones."""
@@ -341,12 +370,12 @@ class Repository:
             dirs[:] = sorted(
                 d
                 for d in dirs
-                if d.lower() not in INTERNAL_NAMES and not self._matches(patterns, prefix + d)
+                if not _is_internal_name(d) and not self._matches(patterns, prefix + d, True)
             )
             for name in sorted(files):
                 path = prefix + name
                 if (
-                    name.lower() not in INTERNAL_NAMES
+                    not _is_internal_name(name)
                     and not self._matches(patterns, path)
                     and not (Path(folder) / name).is_symlink()
                 ):

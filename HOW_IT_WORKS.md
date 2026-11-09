@@ -124,7 +124,7 @@ To tell whether a file changed, pygit hashes it and compares the hash with the o
 
 Switching to another branch or commit means making the working folder look like that commit (`commands.checkout`):
 
-1. **Refuse if it could lose work, before touching anything.** Stop with an error if any tracked file has changes (staged or not). Also stop if the target commit would write over something that is not a clean tracked file: an untracked file, a file hidden by `.pygitignore`, a folder where a file should go, or a plain file where a folder should go. All of these are checked first (`_checkout_conflicts`), so a refusal never leaves a half-done switch.
+1. **Refuse if it could lose work, before touching anything.** Stop with an error if any tracked file has changes (staged or not). Also stop if the target commit would write over something that is not a clean tracked file: an untracked file, a file hidden by `.pygitignore`, a folder where a file should go, or a plain file where a folder should go. All of these are checked first (`_checkout_conflicts`), so an ordinary refusal changes nothing. (A folder that holds no files at all is not a conflict: it is cleared away before the file is written. A case-only rename, such as `Readme.md` to `README.md`, is recognised as the same file on case-insensitive systems.)
 2. **Delete** files that exist in the current commit but not in the target, and remove folders that become empty.
 3. **Write** files whose content differs in the target, from their blobs.
 4. **Replace the index** with the target's files, so the project starts clean.

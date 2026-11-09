@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import zlib
+from pathlib import Path
 
 import pytest
 
@@ -17,6 +18,7 @@ def cli(tmp_path):
     """cli("status") runs `python -m pygit status` in tmp_path: returns (code, stdout, stderr)."""
     env = {k: v for k, v in os.environ.items() if k not in ("PYTHONIOENCODING", "PYTHONUTF8")}
     env.update(
+        PYTHONPATH=str(Path(__file__).resolve().parents[1]),  # works without installing the package
         PYGIT_AUTHOR_NAME="Test Author",
         PYGIT_AUTHOR_EMAIL="test@example.com",
         PYGIT_DATE="1700000000 +0000",

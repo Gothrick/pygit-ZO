@@ -139,6 +139,9 @@ def main(argv: list[str] | None = None) -> int:
     except PygitError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
     except (OSError, ValueError, zlib.error) as error:
         # A file that vanished, a path the system rejects, and so on: report it, do not crash.
         # Set PYGIT_DEBUG=1 to get the full traceback instead.

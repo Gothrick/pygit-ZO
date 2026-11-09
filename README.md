@@ -1,7 +1,7 @@
 # pygit ZO: Git, rebuilt in Python
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-167-2EA44F?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-195-2EA44F?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
 
 pygit ZO is a small implementation of Git in Python (about 1,100 lines with comments), with no dependencies. You run it with the command `pygit`. It stores data in **Git's real object format**, so the two tools understand each other: a repository made by pygit passes `git fsck --strict`, and pygit can read the commits real Git wrote.
@@ -54,7 +54,7 @@ pygit log
 
 Without installing, `python -m pygit <command>` works from the cloned folder.
 
-Settings can also come from environment variables: `PYGIT_AUTHOR_NAME` and `PYGIT_AUTHOR_EMAIL` override the stored identity. `PYGIT_DATE="1700000000 +0100"` fixes the commit time (the tests use it), and `PYGIT_DEBUG=1` shows full Python tracebacks for unexpected errors.
+Settings can also come from environment variables: `PYGIT_AUTHOR_NAME` and `PYGIT_AUTHOR_EMAIL` override the stored identity. `PYGIT_DATE="1700000000 +0100"` fixes the commit time (the tests use it; years after 3000 and impossible time zones are refused), and `PYGIT_DEBUG=1` shows full Python tracebacks for unexpected errors.
 
 ### Check it against real Git
 
@@ -75,7 +75,7 @@ pygit/
   commands.py     Every command, as a function that returns the text to print
   diff.py         Unified diffs
   cli.py          Argument parsing
-tests/            167 tests, including checks against the real git program
+tests/            195 tests, including checks against the real git program
 ```
 
 [HOW_IT_WORKS.md](HOW_IT_WORKS.md) explains the ideas behind each part: how a file becomes a blob, how a commit is built from the index, what a branch really is, and how checkout works.
@@ -97,12 +97,12 @@ pygit is a learning project, not a replacement for Git.
 - The repository folder is `.pygit`, and the **index** is a JSON file (`.pygit/index.json`). Git's index is a binary format; everything else (objects, refs, HEAD) is Git's real format.
 - Only **loose objects** are supported, not pack files. References packed by `git gc` can be read, but a missing object gets an explanatory error.
 - No merge, rebase, tags, stash, or remotes. History is followed through all parents, but pygit never creates merge commits.
-- `checkout` refuses to run when tracked files have staged or unstaged changes, or when it would overwrite an untracked or ignored file, instead of trying to carry changes over. It checks everything first, so a refusal changes nothing.
+- `checkout` refuses to run when tracked files have staged or unstaged changes, or when it would overwrite an untracked or ignored file, instead of trying to carry changes over. It checks for conflicts before touching any file, so a refusal changes nothing, and it warns when you leave a detached commit that no branch can reach.
 - Files inside `.pygit` or any `.git` folder are never added. Symbolic links are skipped.
-- Branch names follow Git's rules plus the names Windows cannot store (`aux`, `con`, `a|b`), and a name that looks like a commit id (for example `abcd1234`) is refused.
+- Branch names follow Git's rules plus the names Windows cannot store (`aux`, `con`, `a|b`). A name made only of 4 to 40 hex digits (`cafe`, `2024`, `abcd1234`) is refused, because it could not be told apart from a commit id, and names that differ only by letter case (`dev` and `Dev`) cannot coexist, because Windows and macOS would store them as one file.
 - pygit records the executable bit where the operating system has one (covered by a test that is skipped on Windows). On Windows every file is a regular file, and a mode change alone is not detected by `status`.
 - `diff` prints a `diff --pygit` header, has no rename detection, and shows no mode lines.
-- Speed is fine for small projects (about 4 seconds to add 3,000 files), but not tuned.
+- Speed is fine for small projects but not tuned: adding thousands of files takes several seconds, depending mostly on the disk.
 
 ## Background
 

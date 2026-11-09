@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import heapq
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -28,9 +30,13 @@ from .objects import (
     parse_ident,
     write_tree,
 )
-from .repository import Repository, is_internal, valid_branch_name
+from .repository import Repository, branch_name_problem, is_internal
 
-DATE_OVERRIDE = re.compile(r"(\d+)(?: ([+-]\d{4}))?")
+DATE_OVERRIDE = re.compile(r"(\d{1,11})(?: ([+-]\d{4}))?")
+LATEST_TIMESTAMP = 32503680000  # the year 3000: later dates make real Git reject the commit
+
+# Windows and macOS file systems treat names that differ only by letter case as the same file.
+CASE_INSENSITIVE_FILESYSTEM = os.name == "nt" or sys.platform == "darwin"
 
 
 def _file_mode(path: Path) -> str:
@@ -67,7 +73,8 @@ def config(repo: Repository, key: str, value: str | None) -> str:
 
 def hash_object(repo: Repository | None, path: Path, write: bool) -> str:
     if not Path(path).is_file():
-        raise PygitError(f"'{path.name}': no such file")
+        what = "is a folder, not a file" if Path(path).is_dir() else "no such file"
+        raise PygitError(f"'{path.name}': {what}")
     data = Path(path).read_bytes()
     if write:
         if repo is None:
@@ -143,7 +150,7 @@ def add(repo: Repository, paths: list[Path], cwd: Path) -> str:
         if absolute.is_dir():
             prefix = relative + "/" if relative else ""
             tracked_here = [p for p in index.files if p.startswith(prefix)]
-            if relative and repo.is_ignored(relative) and not tracked_here:
+            if relative and repo.is_ignored(relative, True) and not tracked_here:
                 raise PygitError(f"'{argument}' is ignored by .pygitignore")
             present = set(repo.worktree_files(relative))
             for tracked in tracked_here:
@@ -295,7 +302,10 @@ def _now() -> tuple[int, str]:
         match = DATE_OVERRIDE.fullmatch(fixed.strip())
         if not match:
             raise PygitError("PYGIT_DATE must look like '1700000000 +0100'")
-        return int(match[1]), match[2] or "+0000"
+        seconds, zone = int(match[1]), match[2] or "+0000"
+        if seconds > LATEST_TIMESTAMP or int(zone[1:3]) > 23 or int(zone[3:5]) > 59:
+            raise PygitError("PYGIT_DATE is out of range")
+        return seconds, zone
     local = datetime.now().astimezone()
     offset = int(local.utcoffset().total_seconds() // 60) if local.utcoffset() else 0
     sign = "+" if offset >= 0 else "-"
@@ -404,8 +414,9 @@ def branch(repo: Repository, name: str | None, start: str | None, delete: bool) 
 
 
 def _new_branch(repo: Repository, name: str, start: str | None) -> str:
-    if not valid_branch_name(name):
-        raise PygitError(f"'{name}' is not a valid branch name")
+    problem = branch_name_problem(name)
+    if problem:
+        raise PygitError(f"'{name}' is not a valid branch name: {problem}")
     clash = repo.branch_conflict(name)
     if clash == name:
         raise PygitError(f"a branch named '{name}' already exists")
@@ -429,17 +440,34 @@ def _remove_file(repo: Repository, path: str) -> None:
         folder = folder.parent
 
 
-def _in_the_way(repo: Repository, path: str, old_files: FileMap) -> bool:
+def _remove_empty_folders(folder: Path) -> None:
+    """Remove a folder, and the folders inside it, as long as no file is inside."""
+    for current, _dirs, _names in os.walk(folder, topdown=False):
+        with contextlib.suppress(OSError):
+            Path(current).rmdir()  # fails (and is skipped) when something is still inside
+
+
+def _tracked_keys(old_files: FileMap) -> set[str]:
+    """Tracked paths, compared the way the file system does (ignoring case where it does)."""
+    return {p.casefold() for p in old_files} if CASE_INSENSITIVE_FILESYSTEM else set(old_files)
+
+
+def _is_tracked(path: str, tracked: set[str]) -> bool:
+    return (path.casefold() if CASE_INSENSITIVE_FILESYSTEM else path) in tracked
+
+
+def _in_the_way(repo: Repository, path: str, tracked: set[str]) -> bool:
     """Whether something on disk at this path would be lost by writing a file there."""
     target = repo.worktree / path
     if target.is_symlink() or target.is_file():
         return True
     if target.is_dir():
-        # A folder only holding tracked files is fine: those files are removed first.
+        # A folder holding only tracked files, or nothing at all, is fine: tracked files are
+        # removed first and empty folders are cleared away before the new file is written.
         for folder, _dirs, names in os.walk(target):
             for name in names:
                 found = (Path(folder) / name).relative_to(repo.worktree).as_posix()
-                if found not in old_files:
+                if not _is_tracked(found, tracked):
                     return True
     return False
 
@@ -448,20 +476,35 @@ def _checkout_conflicts(repo: Repository, old_files: FileMap, new_files: FileMap
     """Paths the checkout would write over something that is not a clean tracked file.
 
     Anything already on disk at a new path counts: an untracked file, an ignored file, or a
-    folder where a file should go. So does a plain file where the new path needs a folder.
+    folder holding such files. So does a plain file where the new path needs a folder.
     """
+    tracked = _tracked_keys(old_files)
     conflicts: set[str] = set()
     for path, entry in new_files.items():
         if old_files.get(path) == entry:
             continue  # the same tracked file is already there
-        if path not in old_files and _in_the_way(repo, path, old_files):
+        if not _is_tracked(path, tracked) and _in_the_way(repo, path, tracked):
             conflicts.add(path)
         parts = path.split("/")
         for length in range(1, len(parts)):
             parent = "/".join(parts[:length])
-            if parent not in old_files and (repo.worktree / parent).is_file():
+            if not _is_tracked(parent, tracked) and (repo.worktree / parent).is_file():
                 conflicts.add(parent)
     return sorted(conflicts)
+
+
+def _orphan_warning(repo: Repository, commit: str | None) -> str:
+    """A warning when leaving a detached HEAD whose commit no branch can reach."""
+    if commit is None:
+        return ""
+    for name in repo.branches():
+        tip = repo.read_branch(name)
+        if tip and any(sha == commit for sha, _ in _history(repo, tip)):
+            return ""
+    return (
+        f"\nWarning: commit {_short(commit)} is not on any branch and can now only be reached "
+        f"by its id.\nTo keep it: pygit branch <name> {_short(commit)}"
+    )
 
 
 def checkout(repo: Repository, target: str, create: bool) -> str:
@@ -484,6 +527,7 @@ def checkout(repo: Repository, target: str, create: bool) -> str:
     if to_branch and to_branch == current:
         return f"Already on '{to_branch}'"
 
+    leaving = repo.head_commit() if current is None else None
     st = compute_status(repo)
     if st.has_tracked_changes:
         raise PygitError(
@@ -509,8 +553,8 @@ def checkout(repo: Repository, target: str, create: bool) -> str:
             if old_files.get(path) == (mode, blob) and (repo.worktree / path).is_file():
                 continue
             file = repo.worktree / path
-            if file.is_dir() and not any(file.iterdir()):
-                file.rmdir()  # an empty folder where a file now goes
+            if file.is_dir():
+                _remove_empty_folders(file)  # folders with no files where a file now goes
             file.parent.mkdir(parents=True, exist_ok=True)
             file.write_bytes(repo.objects.read(blob)[1])
             if os.name != "nt":
@@ -526,7 +570,9 @@ def checkout(repo: Repository, target: str, create: bool) -> str:
     index.save()
 
     if to_branch:
+        warning = _orphan_warning(repo, leaving) if leaving != sha else ""
         repo.checkout_branch_head(to_branch)
-        return f"Switched to branch '{to_branch}'"
+        return f"Switched to branch '{to_branch}'{warning}"
+    warning = _orphan_warning(repo, leaving) if leaving != sha else ""
     repo.detach_head(sha)
-    return f"HEAD is now at {_short(sha)} {repo.read_commit(sha).subject}"
+    return f"HEAD is now at {_short(sha)} {repo.read_commit(sha).subject}{warning}"

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .errors import PygitError
 from .objects import FileMap
 
 
@@ -18,8 +19,13 @@ class Index:
         self.path = path
         self.files: FileMap = {}
         if path.is_file():
-            stored = json.loads(path.read_text(encoding="utf-8"))
-            self.files = {name: (entry["mode"], entry["sha"]) for name, entry in stored.items()}
+            try:
+                stored = json.loads(path.read_text(encoding="utf-8"))
+                self.files = {name: (entry["mode"], entry["sha"]) for name, entry in stored.items()}
+            except (ValueError, TypeError, KeyError, AttributeError):
+                raise PygitError(
+                    f"the index ({path.name}) is damaged: delete it and run 'pygit add' again"
+                ) from None
 
     def save(self) -> None:
         stored = {

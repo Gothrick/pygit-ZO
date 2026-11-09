@@ -7,7 +7,9 @@ from unittest.mock import patch
 import pytest
 
 from pygit import commands
+from pygit.cli import main
 from pygit.errors import PygitError
+from pygit.objects import BLOB, COMMIT, Commit, encode_commit, write_tree
 from pygit.repository import Repository, is_internal, valid_branch_name
 
 needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
@@ -348,3 +350,227 @@ class TestSmallThings:
 
         with pytest.raises(PygitError, match="unknown revision"):
             commands.branch(repo, "topic", "nope", delete=False)
+
+
+class TestBranchNamesAcrossFileSystems:
+    def test_names_differing_only_by_case_cannot_overwrite_each_other(
+        self, pg, repo, commit_file, write
+    ):
+        commit_file("a.txt", "a", "one")
+        pg("branch", "dev")
+        first = repo.read_ref("refs/heads/dev")
+        commit_file("b.txt", "b", "two")
+
+        assert "conflicts with the existing branch 'dev'" in pg("branch", "Dev", expect=1)
+        assert repo.read_ref("refs/heads/dev") == first
+
+    def test_creating_and_switching_to_a_case_variant_is_refused(self, pg, repo, commit_file):
+        commit_file("a.txt", "a", "one")
+        pg("checkout", "-b", "dev")
+
+        assert "conflicts" in pg("checkout", "-b", "Dev", expect=1)
+        assert repo.current_branch() == "dev"
+
+    def test_a_case_variant_of_a_folder_branch_is_refused(self, pg, repo, commit_file):
+        commit_file("a.txt", "a", "one")
+        pg("branch", "feature/x")
+
+        assert "conflicts" in pg("branch", "Feature", expect=1)
+        assert "conflicts" in pg("branch", "FEATURE/X", expect=1)
+
+    def test_the_error_says_why_a_name_is_refused(self, pg, repo, commit_file):
+        commit_file("a.txt", "a", "one")
+
+        assert "looks like a commit id" in pg("branch", "cafe", expect=1)
+        assert "reserved file name on Windows" in pg("branch", "aux", expect=1)
+        assert "not allowed" in pg("branch", "a|b", expect=1)
+
+    def test_a_loose_ref_and_a_packed_ref_of_the_same_branch_cannot_be_half_deleted(
+        self, pg, repo, commit_file
+    ):
+        commit_file("a.txt", "a", "one")
+        pg("branch", "topic")
+        sha = repo.read_ref("refs/heads/topic")
+        (repo.git_dir / "packed-refs").write_bytes(f"{sha} refs/heads/topic\n".encode())
+
+        assert "packed-refs" in pg("branch", "-d", "topic", expect=1)
+        assert "topic" in pg("branch")
+
+
+class TestCheckoutEdgeCases:
+    def test_empty_untracked_folders_where_a_file_goes_are_cleared_not_fatal(
+        self, pg, repo, write, commit_file, tmp_path
+    ):
+        commit_file("a.txt", "main version", "main")
+        pg("checkout", "-b", "f")
+        write("a.txt", "f version")
+        write("thing", "a file on f")
+        pg("add", "a.txt", "thing")
+        pg("commit", "-m", "f work")
+        pg("checkout", "main")
+        (tmp_path / "thing" / "sub").mkdir(parents=True)  # only empty folders
+
+        pg("checkout", "f")
+
+        assert (tmp_path / "thing").read_text() == "a file on f"
+        assert (tmp_path / "a.txt").read_text() == "f version"
+        assert repo.current_branch() == "f"
+        assert "nothing to commit" in pg("status")
+
+    def test_a_folder_with_a_file_inside_still_blocks_and_changes_nothing(
+        self, pg, repo, write, commit_file, tmp_path
+    ):
+        commit_file("a.txt", "main version", "main")
+        pg("checkout", "-b", "f")
+        write("a.txt", "f version")
+        write("thing", "a file on f")
+        pg("add", "a.txt", "thing")
+        pg("commit", "-m", "f work")
+        pg("checkout", "main")
+        write("thing/notes.txt", "keep me")
+
+        assert "would be overwritten" in pg("checkout", "f", expect=1)
+        assert (tmp_path / "a.txt").read_text() == "main version"  # untouched
+        assert (tmp_path / "thing" / "notes.txt").read_text() == "keep me"
+
+    def test_a_rename_that_only_changes_letter_case_can_be_checked_out(
+        self, pg, repo, commit_file, tmp_path
+    ):
+        # Such a commit usually comes from a case-sensitive system (Linux): build it directly.
+        commit_file("Readme.md", "docs", "one")
+        first = repo.head_commit()
+        blob = repo.objects.write(BLOB, b"docs")
+        tree = write_tree(repo.objects, {"README.md": ("100644", blob)})
+        ident = "Test Author <test@example.com> 1700000100 +0000"
+        renamed = repo.objects.write(
+            COMMIT, encode_commit(Commit(tree, [first], ident, ident, "rename to upper case"))
+        )
+        repo.write_ref("refs/heads/f", renamed)
+
+        pg("checkout", "f")  # used to refuse on Windows: "untracked file would be overwritten"
+        assert "README.md" in [p.name for p in tmp_path.iterdir()]
+        assert "nothing to commit" in pg("status")
+
+        pg("checkout", "main")
+        assert "Readme.md" in [p.name for p in tmp_path.iterdir()]
+        assert "nothing to commit" in pg("status")
+
+    def test_leaving_a_detached_commit_behind_warns_how_to_keep_it(self, pg, repo, commit_file):
+        commit_file("a.txt", "a", "one")
+        pg("checkout", repo.head_commit())
+        commit_file("b.txt", "b", "detached work")
+        orphan = repo.head_commit()
+
+        output = pg("checkout", "main")
+
+        assert "Warning" in output and orphan[:7] in output and "pygit branch" in output
+        # Keeping the commit on a branch silences the warning.
+        pg("checkout", orphan)
+        pg("branch", "rescue")
+        assert "Warning" not in pg("checkout", "main")
+
+    def test_no_warning_when_the_detached_commit_is_on_a_branch(self, pg, repo, commit_file):
+        commit_file("a.txt", "a", "one")
+        pg("checkout", repo.head_commit())
+
+        assert "Warning" not in pg("checkout", "main")
+
+
+class TestInputLimits:
+    @pytest.mark.parametrize("value", ["99999999999999999999 +0000", "99999999999 +0000"])
+    def test_a_date_that_real_git_would_reject_is_refused(
+        self, pg, repo, write, monkeypatch, value
+    ):
+        monkeypatch.setenv("PYGIT_DATE", value)
+        write("a.txt", "a")
+        pg("add", "a.txt")
+
+        assert "PYGIT_DATE" in pg("commit", "-m", "x", expect=1)
+
+    @pytest.mark.parametrize("value", ["1700000000 +9999", "1700000000 +2460", "1700000000 -0099"])
+    def test_a_time_zone_out_of_range_is_refused(self, pg, repo, write, monkeypatch, value):
+        monkeypatch.setenv("PYGIT_DATE", value)
+        write("a.txt", "a")
+        pg("add", "a.txt")
+
+        assert "out of range" in pg("commit", "-m", "x", expect=1)
+
+    @pytest.mark.parametrize("content", ['{"a": 1}', "[]", '{"a": {"mode": "100644"}}', "{broken"])
+    def test_a_damaged_index_is_a_clean_error(self, pg, repo, content):
+        (repo.git_dir / "index.json").write_bytes(content.encode())
+
+        assert "damaged" in pg("status", expect=1)
+
+    def test_a_revision_suffix_must_use_plain_digits(self, pg, repo, commit_file):
+        commit_file("a.txt", "a", "one")
+
+        assert "unknown revision" in pg("log", "HEAD~²", expect=1)
+
+    def test_hashing_a_folder_says_so(self, pg, repo):
+        assert "is a folder" in pg("hash-object", ".pygit", expect=1)
+
+
+class TestIgnorePatternEdges:
+    def test_a_trailing_slash_means_folders_only(self, pg, repo, write):
+        write(".pygitignore", "build/\n")
+        write("build", "a file that happens to be called build")
+        write("sub/build/out.bin", "inside a folder called build")
+        write("keep.txt", "keep")
+
+        listed = pg("status")
+
+        assert "\tbuild\n" in listed + "\n"  # the plain file is not ignored
+        assert "out.bin" not in listed  # the folder is
+
+    def test_a_pattern_made_only_of_a_wildcard_and_slash_does_not_hide_everything(
+        self, pg, repo, write
+    ):
+        write(".pygitignore", "*/\n")
+        write("top.txt", "top")
+        write("folder/inner.txt", "inner")
+
+        listed = pg("status")
+
+        assert "top.txt" in listed
+        assert "inner.txt" not in listed
+
+
+class TestWindowsAliasesAndErrorHandling:
+    def test_the_short_name_of_a_git_folder_is_internal(self):
+        assert is_internal("git~1/config") and is_internal("sub/GIT~2/x")
+        assert not is_internal("gitignore-notes/x")
+
+    def test_adding_a_short_git_folder_name_is_refused(self, pg, repo, write):
+        write("GIT~1/config", "x")
+
+        assert "cannot be added" in pg("add", "GIT~1", expect=1)
+        pg("add", ".")
+        assert "GIT~1" not in pg("ls-files")
+
+    def test_an_unexpected_system_error_becomes_a_one_line_message(self, repo, monkeypatch, capsys):
+        def boom(*_args):
+            raise OSError("the disk went away")
+
+        monkeypatch.setattr(commands, "status", boom)
+
+        assert main(["status"]) == 1
+        assert "error: the disk went away" in capsys.readouterr().err
+
+    def test_debug_mode_shows_the_real_traceback_for_unexpected_errors(self, repo, monkeypatch):
+        def boom(*_args):
+            raise OSError("the disk went away")
+
+        monkeypatch.setattr(commands, "status", boom)
+        monkeypatch.setenv("PYGIT_DEBUG", "1")
+
+        with pytest.raises(OSError, match="the disk went away"):
+            main(["status"])
+
+    def test_ctrl_c_ends_quietly_with_the_conventional_status(self, repo, monkeypatch, capsys):
+        def interrupt(*_args):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(commands, "status", interrupt)
+
+        assert main(["status"]) == 130
+        assert "Traceback" not in capsys.readouterr().err
