@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,8 +8,22 @@ version = "0.1.0"
 description = "A small Git implementation in Python that uses Git's real object format"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Zackary Ouirzane" }]
+keywords = ["git", "version-control", "learning", "internals"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Education",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Version Control :: Git",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Gothrick/pygit-ZO"
+Source = "https://github.com/Gothrick/pygit-ZO"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]

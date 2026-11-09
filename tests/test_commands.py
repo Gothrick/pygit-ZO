@@ -436,7 +436,7 @@ class TestCheckout:
 
     def test_commits_made_on_a_detached_head_move_head_only(self, pg, repo, commit_file):
         commit_file("a.txt", "v1", "one")
-        pg("checkout", "HEAD")
+        pg("checkout", repo.head_commit())
         commit_file("b.txt", "b", "two")
 
         assert repo.read_ref("refs/heads/main") != repo.head_commit()
@@ -456,7 +456,7 @@ class TestCheckout:
         pg("checkout", "main")
         write("clash.txt", "my untracked file")
 
-        assert "untracked files would be overwritten" in pg("checkout", "feature", expect=1)
+        assert "would be overwritten" in pg("checkout", "feature", expect=1)
 
     def test_folders_left_empty_are_removed(self, pg, repo, tmp_path, commit_file):
         commit_file("base.txt", "base", "base")

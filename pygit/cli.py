@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
 import sys
+import zlib
 from pathlib import Path
 
 from . import __version__, commands
@@ -107,17 +110,46 @@ def run(args: argparse.Namespace) -> str | bytes:
     raise PygitError(f"unknown command '{args.command}'")
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    try:
-        output = run(args)
-    except PygitError as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 1
+def _use_utf8() -> None:
+    """Print UTF-8 even when output is piped, where Windows would pick a legacy code page.
+
+    Without this, a file named "café.txt" makes `pygit status | more` crash.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        encoding = (getattr(stream, "encoding", "") or "").lower().replace("-", "")
+        if encoding != "utf8" and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+def _write(output: str | bytes) -> None:
     if isinstance(output, bytes):
         sys.stdout.flush()
         sys.stdout.buffer.write(output)
         sys.stdout.buffer.flush()
     elif output:
         print(output)
+        sys.stdout.flush()
+
+
+def main(argv: list[str] | None = None) -> int:
+    _use_utf8()
+    args = build_parser().parse_args(argv)
+    try:
+        output = run(args)
+    except PygitError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, zlib.error) as error:
+        # A file that vanished, a path the system rejects, and so on: report it, do not crash.
+        # Set PYGIT_DEBUG=1 to get the full traceback instead.
+        if os.environ.get("PYGIT_DEBUG"):
+            raise
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    try:
+        _write(output)
+    except BrokenPipeError:
+        # The reader closed early (for example `pygit log | head`). Not an error.
+        with contextlib.suppress(OSError, ValueError):
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
     return 0

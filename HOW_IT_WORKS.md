@@ -124,7 +124,7 @@ To tell whether a file changed, pygit hashes it and compares the hash with the o
 
 Switching to another branch or commit means making the working folder look like that commit (`commands.checkout`):
 
-1. **Refuse if it could lose work.** If any tracked file has uncommitted changes, stop with an error. Untracked files that the target commit would overwrite also stop it.
+1. **Refuse if it could lose work, before touching anything.** Stop with an error if any tracked file has changes (staged or not). Also stop if the target commit would write over something that is not a clean tracked file: an untracked file, a file hidden by `.pygitignore`, a folder where a file should go, or a plain file where a folder should go. All of these are checked first (`_checkout_conflicts`), so a refusal never leaves a half-done switch.
 2. **Delete** files that exist in the current commit but not in the target, and remove folders that become empty.
 3. **Write** files whose content differs in the target, from their blobs.
 4. **Replace the index** with the target's files, so the project starts clean.
@@ -141,7 +141,19 @@ The most useful tests do not check pygit against itself. They run the real `git`
 - `git cat-file -p HEAD` must print the same commit text, and `git hash-object` the same ids.
 - In the other direction, objects created by real Git are copied into a pygit repository and read back.
 
-The tests were also checked by breaking the code on purpose (sorting trees the wrong way, removing the checkout safety check) to confirm that they fail when they should.
+The tests were also checked by breaking the code on purpose (sorting trees the wrong way, removing the checkout safety checks, letting `.git` folders be added) to confirm that they fail when they should.
+
+Some tests run `pygit` as a separate process with its output piped, the way a shell does. Tests that run inside the test process cannot see problems that only appear with real, redirected output: a file named `café.txt` made `pygit status` crash on Windows until output was forced to UTF-8.
+
+### Safety rules worth knowing
+
+A version control tool has to protect your files, so pygit is strict in a few places:
+
+- `add` never stages anything inside `.pygit` or a `.git` folder (a nested `.git` makes real Git's `fsck` fail).
+- Branch names follow Git's reference-name rules (plus Windows file-name limits), so a branch name can never become a path that leaves `.pygit/refs/heads`.
+- A commit's author name and email may not contain `<`, `>`, or line breaks, because those would corrupt the commit's author line.
+- Objects read from a repository are validated: a corrupt file, or a tree that names a path like `..` or `.git`, is reported as an error.
+- Unexpected system errors (a file that vanished, a path the system rejects) are printed as one-line errors instead of a Python traceback.
 
 ## Where to look
 

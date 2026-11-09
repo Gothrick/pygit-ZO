@@ -63,8 +63,17 @@ class ObjectStore:
         """Return (kind, content) for an object."""
         path = self._path(sha)
         if not path.is_file():
+            pack_folder = self.directory / "pack"
+            if pack_folder.is_dir() and any(pack_folder.iterdir()):
+                raise PygitError(
+                    f"object {sha} not found: it may be in a pack file, "
+                    "which pygit cannot read (it reads loose objects only)"
+                )
             raise PygitError(f"object {sha} not found")
-        raw = zlib.decompress(path.read_bytes())
+        try:
+            raw = zlib.decompress(path.read_bytes())
+        except zlib.error:
+            raise PygitError(f"object {sha} is corrupt") from None
         header, _, data = raw.partition(b"\0")
         kind, _, size = header.decode().partition(" ")
         if not size.isdigit() or int(size) != len(data):
@@ -133,6 +142,11 @@ def flatten_tree(store: ObjectStore, tree_sha: str, prefix: str = "") -> FileMap
         raise PygitError(f"{tree_sha} is a {kind}, not a tree")
     files: FileMap = {}
     for entry in decode_tree(data):
+        # A tree must never name a path that leads outside the working folder or into .git.
+        if entry.name in ("", ".", "..") or "/" in entry.name or "\\" in entry.name:
+            raise PygitError(f"tree {tree_sha} contains an unsafe path name: {entry.name!r}")
+        if entry.name.lower() in (".git", ".pygit"):
+            raise PygitError(f"tree {tree_sha} contains a forbidden folder name: {entry.name!r}")
         path = prefix + entry.name
         if entry.is_tree:
             files.update(flatten_tree(store, entry.sha, path + "/"))

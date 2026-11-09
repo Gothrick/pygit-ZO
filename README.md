@@ -1,7 +1,7 @@
 # pygit ZO: Git, rebuilt in Python
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-91-2EA44F?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-167-2EA44F?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
 
 pygit ZO is a small implementation of Git in Python (about 1,100 lines with comments), with no dependencies. You run it with the command `pygit`. It stores data in **Git's real object format**, so the two tools understand each other: a repository made by pygit passes `git fsck --strict`, and pygit can read the commits real Git wrote.
@@ -25,7 +25,9 @@ pygit ZO is a small implementation of Git in Python (about 1,100 lines with comm
 | `pygit cat-file -p/-t/-s <object>` | Show an object's content, type, or size |
 | `pygit ls-files`, `pygit ls-tree [-r] [rev]` | List the index, or the files of a commit |
 
-Revisions can be `HEAD`, a branch name, a full or abbreviated SHA-1, or `<rev>~N` (for example `HEAD~2`). A `.pygitignore` file with simple wildcard patterns keeps files out of `add` and `status`.
+Revisions can be `HEAD`, a branch name, a full or abbreviated SHA-1 (at least 4 hex digits), or `<rev>~N` (for example `HEAD~2`). Run `pygit --version` to see the version.
+
+A `.pygitignore` file keeps untracked files out of `add` and `status`: one wildcard pattern per line (`*.log`, `build/`, `/top-level-only`), with `#` for comments. There is no negation (`!pattern`), and `*` also matches across `/`. A file that is already tracked stays tracked even if a pattern later matches it.
 
 ## Try it
 
@@ -50,7 +52,9 @@ pygit commit -m "First commit"
 pygit log
 ```
 
-You can also run it without installing: `python -m pygit <command>`.
+Without installing, `python -m pygit <command>` works from the cloned folder.
+
+Settings can also come from environment variables: `PYGIT_AUTHOR_NAME` and `PYGIT_AUTHOR_EMAIL` override the stored identity. `PYGIT_DATE="1700000000 +0100"` fixes the commit time (the tests use it), and `PYGIT_DEBUG=1` shows full Python tracebacks for unexpected errors.
 
 ### Check it against real Git
 
@@ -71,7 +75,7 @@ pygit/
   commands.py     Every command, as a function that returns the text to print
   diff.py         Unified diffs
   cli.py          Argument parsing
-tests/            91 tests, including checks against the real git program
+tests/            167 tests, including checks against the real git program
 ```
 
 [HOW_IT_WORKS.md](HOW_IT_WORKS.md) explains the ideas behind each part: how a file becomes a blob, how a commit is built from the index, what a branch really is, and how checkout works.
@@ -84,18 +88,21 @@ pytest
 ruff check .
 ```
 
-The suite covers the object formats, every command (including error cases such as dirty checkouts and invalid branch names), and **interoperability**: real `git fsck --strict`, `git log`, and `git ls-tree` run on pygit repositories, and pygit reads objects written by real Git. The interop tests are skipped if `git` is not installed, and one test about the executable bit is skipped on Windows.
+The suite covers the object formats, every command, and **interoperability**: real `git fsck --strict`, `git log`, and `git ls-tree` run on pygit repositories, and pygit reads objects written by real Git. It also covers the cases where a version control tool must not lose or corrupt data: checkout never overwrites untracked or ignored files, repository folders cannot be added, branch names and identities are validated, and problems are reported as one-line errors (some tests run `pygit` as a separate process with piped output, so Unicode file names and error handling are tested the way a shell uses them). The interop tests are skipped if `git` is not installed, and one test about the executable bit is skipped on Windows.
 
 ## How it differs from real Git
 
 pygit is a learning project, not a replacement for Git.
 
 - The repository folder is `.pygit`, and the **index** is a JSON file (`.pygit/index.json`). Git's index is a binary format; everything else (objects, refs, HEAD) is Git's real format.
-- Only **loose objects** are supported, not pack files.
+- Only **loose objects** are supported, not pack files. References packed by `git gc` can be read, but a missing object gets an explanatory error.
 - No merge, rebase, tags, stash, or remotes. History is followed through all parents, but pygit never creates merge commits.
-- `checkout` refuses to run when tracked files have uncommitted changes, instead of trying to carry them over.
-- `diff` prints a `diff --pygit` header and has no rename detection.
-- `.pygitignore` supports simple wildcard patterns only (no negation).
+- `checkout` refuses to run when tracked files have staged or unstaged changes, or when it would overwrite an untracked or ignored file, instead of trying to carry changes over. It checks everything first, so a refusal changes nothing.
+- Files inside `.pygit` or any `.git` folder are never added. Symbolic links are skipped.
+- Branch names follow Git's rules plus the names Windows cannot store (`aux`, `con`, `a|b`), and a name that looks like a commit id (for example `abcd1234`) is refused.
+- pygit records the executable bit where the operating system has one (covered by a test that is skipped on Windows). On Windows every file is a regular file, and a mode change alone is not detected by `status`.
+- `diff` prints a `diff --pygit` header, has no rename detection, and shows no mode lines.
+- Speed is fine for small projects (about 4 seconds to add 3,000 files), but not tuned.
 
 ## Background
 

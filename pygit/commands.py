@@ -28,11 +28,9 @@ from .objects import (
     parse_ident,
     write_tree,
 )
-from .repository import Repository
+from .repository import Repository, is_internal, valid_branch_name
 
-BRANCH_NAME_RULES = re.compile(
-    r"^(?!-)(?!.*\.\.)(?!.*//)(?!/)(?!.*/$)(?!.*\.lock$)[^\s~^:?*\[\\]+$"
-)
+DATE_OVERRIDE = re.compile(r"(\d+)(?: ([+-]\d{4}))?")
 
 
 def _file_mode(path: Path) -> str:
@@ -50,6 +48,8 @@ def _short(sha: str) -> str:
 
 
 def init(path: Path) -> str:
+    if path.is_file():
+        raise PygitError(f"'{path}' is a file, not a folder")
     repo, existed = Repository.init(path)
     verb = "Reinitialized existing" if existed else "Initialized empty"
     return f"{verb} pygit repository in {repo.git_dir}"
@@ -66,6 +66,8 @@ def config(repo: Repository, key: str, value: str | None) -> str:
 
 
 def hash_object(repo: Repository | None, path: Path, write: bool) -> str:
+    if not Path(path).is_file():
+        raise PygitError(f"'{path.name}': no such file")
     data = Path(path).read_bytes()
     if write:
         if repo is None:
@@ -133,23 +135,34 @@ def add(repo: Repository, paths: list[Path], cwd: Path) -> str:
         except ValueError:
             raise PygitError(f"'{argument}' is outside the repository") from None
         relative = "" if relative == "." else relative
+        if relative and is_internal(relative):
+            raise PygitError(
+                f"'{argument}' is repository data (.pygit or .git) and cannot be added"
+            )
 
         if absolute.is_dir():
-            present = repo.worktree_files(relative)
             prefix = relative + "/" if relative else ""
-            for tracked in [p for p in index.files if p.startswith(prefix) and p not in present]:
-                del index.files[tracked]  # deleted from the working folder since it was staged
-        elif absolute.is_file():
-            if repo.is_ignored(relative):
+            tracked_here = [p for p in index.files if p.startswith(prefix)]
+            if relative and repo.is_ignored(relative) and not tracked_here:
                 raise PygitError(f"'{argument}' is ignored by .pygitignore")
-            present = [relative]
+            present = set(repo.worktree_files(relative))
+            for tracked in tracked_here:
+                if (repo.worktree / tracked).is_file():
+                    present.add(tracked)  # a tracked file stays tracked even if it is now ignored
+                else:
+                    del index.files[tracked]  # deleted from the working folder since it was staged
+            to_stage = sorted(present)
+        elif absolute.is_file():
+            if repo.is_ignored(relative) and relative not in index.files:
+                raise PygitError(f"'{argument}' is ignored by .pygitignore")
+            to_stage = [relative]
         elif relative in index.files:
             del index.files[relative]
             continue
         else:
             raise PygitError(f"'{argument}' did not match any files")
 
-        for path in present:
+        for path in to_stage:
             full = repo.worktree / path
             sha = repo.objects.write(BLOB, full.read_bytes())
             _drop_conflicts(index.files, path)
@@ -195,13 +208,15 @@ def compute_status(repo: Repository) -> Status:
         elif head[path] != staged[path]:
             status.staged_modified.append(path)
 
-    present = set(repo.worktree_files())
+    # A tracked file is judged by what is on disk, even if .pygitignore now matches it.
     for path, (_, sha) in sorted(staged.items()):
-        if path not in present:
+        file = repo.worktree / path
+        if not file.is_file():
             status.deleted.append(path)
-        elif object_id(BLOB, (repo.worktree / path).read_bytes()) != sha:
+        elif object_id(BLOB, file.read_bytes()) != sha:
             status.modified.append(path)
-    status.untracked = sorted(present - set(staged))
+    # Untracked files are the ones found in the working folder, minus ignored ones.
+    status.untracked = sorted(set(repo.worktree_files()) - set(staged))
     return status
 
 
@@ -277,8 +292,10 @@ def _now() -> tuple[int, str]:
     """(Unix time, "+HHMM" zone). PYGIT_DATE="1700000000 +0100" fixes it, which tests rely on."""
     fixed = os.environ.get("PYGIT_DATE")
     if fixed:
-        seconds, _, zone = fixed.partition(" ")
-        return int(seconds), zone or "+0000"
+        match = DATE_OVERRIDE.fullmatch(fixed.strip())
+        if not match:
+            raise PygitError("PYGIT_DATE must look like '1700000000 +0100'")
+        return int(match[1]), match[2] or "+0000"
     local = datetime.now().astimezone()
     offset = int(local.utcoffset().total_seconds() // 60) if local.utcoffset() else 0
     sign = "+" if offset >= 0 else "-"
@@ -346,6 +363,8 @@ def _history(repo: Repository, start: str) -> list[tuple[str, Commit]]:
 
 
 def log(repo: Repository, revision: str, oneline: bool, max_count: int | None) -> str:
+    if max_count is not None and max_count < 0:
+        raise PygitError("-n must be zero or more")
     entries = _history(repo, repo.resolve(revision))
     if max_count is not None:
         entries = entries[:max_count]
@@ -377,10 +396,7 @@ def branch(repo: Repository, name: str | None, start: str | None, delete: bool) 
     if delete:
         if name == repo.current_branch():
             raise PygitError(f"cannot delete the branch '{name}' you are on")
-        path = repo.git_dir / "refs" / "heads" / name
-        if not path.is_file():
-            raise PygitError(f"branch '{name}' not found")
-        path.unlink()
+        repo.delete_branch(name)
         return f"Deleted branch {name}"
 
     sha = _new_branch(repo, name, start)
@@ -388,10 +404,13 @@ def branch(repo: Repository, name: str | None, start: str | None, delete: bool) 
 
 
 def _new_branch(repo: Repository, name: str, start: str | None) -> str:
-    if not BRANCH_NAME_RULES.match(name):
+    if not valid_branch_name(name):
         raise PygitError(f"'{name}' is not a valid branch name")
-    if repo.read_ref(f"refs/heads/{name}"):
+    clash = repo.branch_conflict(name)
+    if clash == name:
         raise PygitError(f"a branch named '{name}' already exists")
+    if clash:
+        raise PygitError(f"cannot create '{name}': it conflicts with the existing branch '{clash}'")
     sha = repo.resolve(start or "HEAD") if (start or repo.head_commit()) else None
     if sha is None:
         raise PygitError("cannot create a branch before the first commit")
@@ -410,6 +429,41 @@ def _remove_file(repo: Repository, path: str) -> None:
         folder = folder.parent
 
 
+def _in_the_way(repo: Repository, path: str, old_files: FileMap) -> bool:
+    """Whether something on disk at this path would be lost by writing a file there."""
+    target = repo.worktree / path
+    if target.is_symlink() or target.is_file():
+        return True
+    if target.is_dir():
+        # A folder only holding tracked files is fine: those files are removed first.
+        for folder, _dirs, names in os.walk(target):
+            for name in names:
+                found = (Path(folder) / name).relative_to(repo.worktree).as_posix()
+                if found not in old_files:
+                    return True
+    return False
+
+
+def _checkout_conflicts(repo: Repository, old_files: FileMap, new_files: FileMap) -> list[str]:
+    """Paths the checkout would write over something that is not a clean tracked file.
+
+    Anything already on disk at a new path counts: an untracked file, an ignored file, or a
+    folder where a file should go. So does a plain file where the new path needs a folder.
+    """
+    conflicts: set[str] = set()
+    for path, entry in new_files.items():
+        if old_files.get(path) == entry:
+            continue  # the same tracked file is already there
+        if path not in old_files and _in_the_way(repo, path, old_files):
+            conflicts.add(path)
+        parts = path.split("/")
+        for length in range(1, len(parts)):
+            parent = "/".join(parts[:length])
+            if parent not in old_files and (repo.worktree / parent).is_file():
+                conflicts.add(parent)
+    return sorted(conflicts)
+
+
 def checkout(repo: Repository, target: str, create: bool) -> str:
     """Switch to a branch (or a commit, which detaches HEAD) and update the working folder."""
     current = repo.current_branch()
@@ -418,9 +472,17 @@ def checkout(repo: Repository, target: str, create: bool) -> str:
         repo.checkout_branch_head(target)
         return f"Switched to a new branch '{target}'"
 
-    branch_sha = repo.read_ref(f"refs/heads/{target}")
+    if target == "HEAD":  # nothing to switch to: stay where we are
+        head = repo.head_commit()
+        if head is None:
+            raise PygitError("HEAD does not point to a commit yet")
+        return f"Already on '{current}'" if current else f"HEAD is already at {_short(head)}"
+
+    branch_sha = repo.read_branch(target)
     sha = branch_sha or repo.resolve(target)
     to_branch = target if branch_sha else None
+    if to_branch and to_branch == current:
+        return f"Already on '{to_branch}'"
 
     st = compute_status(repo)
     if st.has_tracked_changes:
@@ -431,22 +493,33 @@ def checkout(repo: Repository, target: str, create: bool) -> str:
 
     old_files = repo.commit_files(repo.head_commit())
     new_files = repo.commit_files(sha)
-    blocking = [path for path in new_files if path in st.untracked]
+    # Check every conflict before touching the disk, so a refusal never leaves a half-done switch.
+    blocking = _checkout_conflicts(repo, old_files, new_files)
     if blocking:
         raise PygitError(
-            "untracked files would be overwritten by checkout: " + ", ".join(sorted(blocking))
+            "untracked or ignored files would be overwritten by checkout: "
+            + ", ".join(blocking)
+            + "\nmove or delete them first, then try again"
         )
 
-    for path in sorted(set(old_files) - set(new_files)):
-        _remove_file(repo, path)
-    for path, (mode, blob) in sorted(new_files.items()):
-        if old_files.get(path) == (mode, blob) and (repo.worktree / path).is_file():
-            continue
-        file = repo.worktree / path
-        file.parent.mkdir(parents=True, exist_ok=True)
-        file.write_bytes(repo.objects.read(blob)[1])
-        if os.name != "nt":
-            file.chmod(0o755 if mode == MODE_EXEC else 0o644)
+    try:
+        for path in sorted(set(old_files) - set(new_files)):
+            _remove_file(repo, path)
+        for path, (mode, blob) in sorted(new_files.items()):
+            if old_files.get(path) == (mode, blob) and (repo.worktree / path).is_file():
+                continue
+            file = repo.worktree / path
+            if file.is_dir() and not any(file.iterdir()):
+                file.rmdir()  # an empty folder where a file now goes
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(repo.objects.read(blob)[1])
+            if os.name != "nt":
+                file.chmod(0o755 if mode == MODE_EXEC else 0o644)
+    except OSError as error:
+        raise PygitError(
+            f"checkout stopped while updating the working folder ({error}); "
+            "run 'pygit status' to see what changed"
+        ) from error
 
     index = repo.index
     index.files = dict(new_files)
@@ -454,10 +527,6 @@ def checkout(repo: Repository, target: str, create: bool) -> str:
 
     if to_branch:
         repo.checkout_branch_head(to_branch)
-        return (
-            f"Switched to branch '{to_branch}'"
-            if to_branch != current
-            else f"Already on '{to_branch}'"
-        )
+        return f"Switched to branch '{to_branch}'"
     repo.detach_head(sha)
     return f"HEAD is now at {_short(sha)} {repo.read_commit(sha).subject}"
